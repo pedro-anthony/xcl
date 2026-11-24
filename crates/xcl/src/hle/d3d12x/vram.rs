@@ -595,6 +595,18 @@ pub fn page_bytes() -> (usize, usize) {
     })
 }
 
+/// (bytes of tiles past a texture's own 64 KiB pages – small textures, the PC's mip tails –,
+/// textures on pages) – `XCL_ACTIVITY`
+pub fn extra_page_bytes() -> (usize, usize) {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().fold((0, 0), |(extra, n), p| (extra + p.extra_pages.len() * PAGE, n + p.targets.len()))
+}
+
+/// The title addresses of the pages in use (`XCL_ACTIVITY`: which of them `sparse` holds too)
+pub fn page_addresses() -> Vec<usize> {
+    PAGES.lock().unwrap().values().flatten().flat_map(|p| p.pages.keys().copied().collect::<Vec<_>>()).collect()
+}
+
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
 fn tier2(dev: &ID3D12Device) -> bool {
     let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();

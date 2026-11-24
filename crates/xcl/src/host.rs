@@ -60,19 +60,40 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                // (the page list first: the two modules' locks are not held together)
+                let twice = crate::hle::d3d12x::sparse::mapped_among(&crate::hle::d3d12x::vram::page_addresses()) << 16;
+                let (extra, on_pages) = crate::hle::d3d12x::vram::extra_page_bytes();
+                let sources = crate::hle::d3d12x::title_textures::source_tiles();
+                let src_twice = crate::hle::d3d12x::sparse::mapped_among(&sources) << 16;
+                let zeros = crate::hle::d3d12x::sparse::zero_tiles() << 16;
+                let (sys_tiles, moved) = crate::hle::d3d12x::sparse::sysmem_tiles();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB, {} MB of them on mapped sparse tiles too; {} MB extra tiles, {} textures reading {} MB, {} MB of it on mapped sparse tiles); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped, {} MB of it all zeros); sparse tiles in system memory {} MB ({} moved to video memory)",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
                     mb(pages as u64),
                     mb(page_pools as u64),
+                    mb(twice as u64),
+                    mb(extra as u64),
+                    on_pages,
+                    mb((sources.len() << 16) as u64),
+                    mb(src_twice as u64),
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(pools_mapped as u64),
+                    mb(zeros as u64),
+                    mb((sys_tiles << 16) as u64),
+                    moved
                 );
+                // (once a minute) where the all-zero tiles are
+                static ZR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if ZR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30 == 5 {
+                    let runs: Vec<String> = crate::hle::d3d12x::sparse::zero_runs(12).iter().map(|&(a, n)| format!("{a:#x}+{}MB", n >> 20)).collect();
+                    crate::xlog_info!("memory: largest all-zero sparse tile runs: {}", runs.join(", "));
+                }
                 last = now;
             }
         });

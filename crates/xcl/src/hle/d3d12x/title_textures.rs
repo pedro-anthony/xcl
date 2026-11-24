@@ -478,6 +478,16 @@ pub fn note_gpu_write(res: usize) {
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
+/// The 64 KiB tiles of the memory the textures kept in step read (`XCL_ACTIVITY`: which of them
+/// `sparse` also holds in video memory)
+pub fn source_tiles() -> Vec<usize> {
+    let t = TEXTURES.lock().unwrap();
+    let mut v: Vec<usize> = t.by_res.values().flat_map(|e| (e.src & !0xFFFF..e.src + e.tex.size() as usize).step_by(0x10000)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
     TEXTURES.lock().unwrap().overlapping(va, len)

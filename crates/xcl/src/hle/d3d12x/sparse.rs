@@ -209,6 +209,12 @@ struct State {
     /// video-memory pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
     free: Vec<(u32, u32)>,
+    /// pools in system memory (`zero_tiles_in_sysmem`): tiles that have held only zeros so far
+    sys_pool: Vec<bool>,
+    /// free tiles of the system-memory pools
+    free_sys: Vec<(u32, u32)>,
+    /// a tile moving from system to video memory passes through it (`migrate`)
+    migrate_buf: Option<ID3D12Resource>,
     /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
     /// went by (titles' queues may still read what was mapped there)
     retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
@@ -394,7 +400,7 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return (0, 0) };
-    let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
+    let pools = s.pools.iter().enumerate().filter(|(h, p)| p.is_some() && !s.sys_pool.get(*h).copied().unwrap_or(false)).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
@@ -593,6 +599,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             windows,
             pools: Vec::new(),
             free: Vec::new(),
+            sys_pool: Vec::new(),
+            free_sys: Vec::new(),
+            migrate_buf: None,
             retired: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
@@ -638,13 +647,21 @@ impl State {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
     }
 
-    unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
-        if let Some(t) = self.free.pop() {
+    /// A free pool tile (`sys`: of a system-memory pool), else a new pool's first; (tile, reused).
+    unsafe fn take_tile(&mut self, sys: bool) -> Option<((u32, u32), bool)> {
+        if let Some(t) = if sys { self.free_sys.pop() } else { self.free.pop() } {
             return Some((t, true));
         }
+        // system memory the GPU reaches over the bus: CUSTOM, L0, write-combined (vkd3d keeps
+        // an L0 heap without CPU access in video memory)
+        let props = if sys {
+            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() }
+        } else {
+            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }
+        };
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Properties: props,
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
@@ -664,7 +681,11 @@ impl State {
                 self.pools.len() as u32 - 1
             }
         };
-        self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
+        if self.sys_pool.len() <= h as usize {
+            self.sys_pool.resize(h as usize + 1, false);
+        }
+        self.sys_pool[h as usize] = sys;
+        if sys { &mut self.free_sys } else { &mut self.free }.extend((1..POOL_TILES).rev().map(|t| (h, t)));
         Some(((h, 0), false))
     }
 
@@ -675,11 +696,11 @@ impl State {
         let now = std::time::Instant::now();
         let done = unsafe { self.fence.GetCompletedValue() };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
-        if self.free.len() < POOL_TILES as usize {
+        if self.free.len() + self.free_sys.len() < POOL_TILES as usize {
             return;
         }
         let mut count = vec![0u32; self.pools.len()];
-        for &(h, _) in &self.free {
+        for &(h, _) in self.free.iter().chain(&self.free_sys) {
             count[h as usize] += 1;
         }
         let gone: Vec<usize> = (0..count.len()).filter(|&h| count[h] == POOL_TILES && self.pools[h].is_some()).collect();
@@ -687,6 +708,7 @@ impl State {
             return;
         }
         self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
+        self.free_sys.retain(|&(h, _)| !gone.contains(&(h as usize)));
         for h in gone {
             if let Some(heap) = self.pools[h].take() {
                 self.retired.push((heap, self.value, now));
@@ -796,7 +818,7 @@ impl State {
         let mut t = first;
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
-                let Some((tile, reused)) = self.take_tile() else { break };
+                let Some((tile, reused)) = self.take_tile(zero_tiles_in_sysmem()) else { break };
                 let holes = initial_holes(t);
                 self.mapped.insert(t, TileEntry::with_holes(tile, holes));
                 if holes != 0xFFFF {
@@ -1360,6 +1382,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         return;
     };
     let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
+    s.sort_free();
     if tiles.is_empty() {
         return;
     }
@@ -1384,8 +1407,132 @@ impl State {
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) {
             self.free.push(tile);
+            self.sort_free();
         }
     }
+
+    /// Tiles of system-memory pools that went to `free` (the decommit paths do not know the
+    /// kinds) move to `free_sys`.
+    fn sort_free(&mut self) {
+        if self.free_sys.is_empty() && !self.sys_pool.iter().any(|&b| b) {
+            return;
+        }
+        let sys = &self.sys_pool;
+        let (to_sys, keep): (Vec<_>, Vec<_>) = self.free.drain(..).partition(|t| sys.get(t.0 as usize).copied().unwrap_or(false));
+        self.free = keep;
+        self.free_sys.extend(to_sys);
+    }
+
+    fn in_sysmem(&self, tile: (u32, u32)) -> bool {
+        self.sys_pool.get(tile.0 as usize).copied().unwrap_or(false)
+    }
+
+    /// Mapped tiles at `ts` in system-memory pools the CPU now writes go to video memory: their
+    /// contents copied out, the tile remapped, copied back (what the GPU wrote there stays), all
+    /// in order on `queue` before the upload of the CPU's writes. Tiles a placed buffer shares
+    /// (`pinned`) stay where they are.
+    unsafe fn migrate(&mut self, ts: &[usize]) {
+        const BATCH: usize = 64;
+        let ts: Vec<usize> = ts.iter().copied().filter(|t| self.mapped.get(t).is_some_and(|e| self.in_sysmem(e.pool) && !self.pinned.contains_key(&e.pool))).collect();
+        if ts.is_empty() {
+            return;
+        }
+        if self.migrate_buf.is_none() {
+            let mut r: Option<ID3D12Resource> = None;
+            let mut d = buffer_desc((BATCH * TILE) as u64);
+            d.Flags = D3D12_RESOURCE_FLAG_NONE;
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            if self.dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_err() {
+                return;
+            }
+            self.migrate_buf = r;
+        }
+        let Some(buf) = self.migrate_buf.clone() else { return };
+        for batch in ts.chunks(BATCH) {
+            let wins: Vec<(usize, usize)> = batch.iter().filter_map(|&t| self.window_index(t).map(|wi| (t, wi))).collect();
+            let out = self.begin_slot();
+            for (i, &(t, wi)) in wins.iter().enumerate() {
+                self.slots[out].list.CopyBufferRegion(&buf, (i * TILE) as u64, &self.windows[wi].1, (t - self.windows[wi].0) as u64, TILE as u64);
+            }
+            self.submit_slot(out);
+            let mut old = Vec::with_capacity(wins.len());
+            let mut moved = Vec::with_capacity(wins.len());
+            for &(t, wi) in &wins {
+                let Some((tile, _)) = self.take_tile(false) else { break };
+                let entry = self.mapped.get_mut(&t).expect("a mapped tile");
+                old.push(std::mem::replace(&mut entry.pool, tile));
+                moved.push((t, wi, tile));
+            }
+            for &(t, wi, tile) in &moved {
+                let r = self.windows[wi].1.clone();
+                self.map_tiles(&r, self.windows[wi].0, &[(t, tile)]);
+            }
+            let back = self.begin_slot();
+            for (i, &(t, wi, _)) in moved.iter().enumerate() {
+                self.slots[back].list.CopyBufferRegion(&self.windows[wi].1, (t - self.windows[wi].0) as u64, &buf, (i * TILE) as u64, TILE as u64);
+            }
+            self.submit_slot(back);
+            // (the next user of an old tile zeroes it first: `to_zero` of a reused tile)
+            self.free_sys.extend(old);
+            MIGRATED.fetch_add(moved.len() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Tiles committed in the sparse windows start in system memory and move to video memory when
+/// the CPU first writes them (`State::migrate`): a title that clears gigabytes of pools at start
+/// (a retail game: 3.5 of 4.6 GB of mapped tiles only zeros) would otherwise fill video memory
+/// with zeros. Only with `XCL_ZERO_TILES=1`: the retail game stopped submitting work ~20 s after
+/// its first menu with it (not understood yet).
+fn zero_tiles_in_sysmem() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_ZERO_TILES").is_ok_and(|v| v == "1"))
+}
+
+/// tiles moved from system to video memory (`XCL_ACTIVITY`)
+static MIGRATED: AtomicU64 = AtomicU64::new(0);
+
+/// (mapped tiles in system memory, tiles moved to video memory so far) – `XCL_ACTIVITY`
+pub fn sysmem_tiles() -> (usize, u64) {
+    let g = STATE.lock().unwrap();
+    let n = g.as_ref().map_or(0, |s| s.mapped.values().filter(|e| s.in_sysmem(e.pool)).count());
+    (n, MIGRATED.load(Ordering::Relaxed))
+}
+
+/// Mapped tiles whose every page was all zeros when last sent to the GPU (`XCL_ACTIVITY`: video
+/// memory that only holds zeros – an unmapped tile reads as zero too)
+pub fn zero_tiles() -> usize {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return 0 };
+    s.mapped.values().filter(|e| e.holes != u16::MAX && e.sent.iter().all(|p| p.is_none())).count()
+}
+
+/// The largest runs of mapped all-zero tiles, (start, bytes), biggest first (`XCL_ACTIVITY`:
+/// what memory they are)
+pub fn zero_runs(n: usize) -> Vec<(usize, usize)> {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    let mut ts: Vec<usize> = s.mapped.iter().filter(|(_, e)| e.holes != u16::MAX && e.sent.iter().all(|p| p.is_none())).map(|(&t, _)| t).collect();
+    drop(g);
+    ts.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for t in ts {
+        match runs.last_mut() {
+            Some(r) if r.0 + r.1 == t => r.1 += TILE,
+            _ => runs.push((t, TILE)),
+        }
+    }
+    runs.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
+    runs.truncate(n);
+    runs
+}
+
+/// How many of the 64 KiB pages at `addrs` are also tiles of a sparse window with video memory
+/// mapped (`XCL_ACTIVITY`: title memory held twice – its bytes here and a texture on `vram`'s pages)
+pub fn mapped_among(addrs: &[usize]) -> usize {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return 0 };
+    addrs.iter().filter(|&&a| s.mapped.get(&(a & !(TILE - 1))).is_some_and(|e| e.holes != u16::MAX)).count()
 }
 
 /// The sparse windows' committed mapped tiles as sorted, merged (start, end) runs: where a CPU
@@ -1452,6 +1599,12 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
+    // tiles in system memory the CPU now writes move to video memory first
+    if !dirty_runs.is_empty() && s.sys_pool.iter().any(|&b| b) {
+        let mut ts: Vec<usize> = dirty_runs.iter().flat_map(|&(a, n)| (a & !(TILE - 1)..a + n).step_by(TILE)).collect();
+        ts.dedup();
+        s.migrate(&ts);
+    }
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     if !zero_runs.is_empty() {
         s.upload_zeros(&zero_runs);
@@ -1720,6 +1873,9 @@ mod tests {
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
+                sys_pool: Vec::new(),
+                free_sys: Vec::new(),
+                migrate_buf: None,
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
