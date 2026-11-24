@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+mod alloc_pool;
 pub mod bind;
 pub mod compose;
 pub mod console_heap;
@@ -19,6 +20,7 @@ mod cpu_writes;
 mod fence_x;
 pub mod frame;
 pub mod guard;
+mod late_release;
 pub mod layout;
 pub mod list_x;
 pub mod null;

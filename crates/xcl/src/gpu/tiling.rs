@@ -131,7 +131,10 @@ impl Layout {
         };
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
         // the pattern masks are 16 bits: coordinates above them do not matter
-        let high = |l: u32, shift: u32| table(1 << (16 - l.min(16)), shift, l);
+        let high = |l: u32, shift: u32| {
+            let used = bits[..blk as usize].iter().fold(0u32, |m, &b| m | ((b >> shift) & 0xFFFF) as u32) >> l.min(16);
+            table(1 << (32 - used.leading_zeros()), shift, l)
+        };
         Layout {
             mode,
             elem_log2,
@@ -409,21 +412,43 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
+        let t = &self.layout;
+        let e = 1usize << t.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        if out.is_empty() {
+        if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
+            // linear: a row's elements are contiguous, so it is copied whole (the elements that
+            // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
+            let row = l.width * e;
+            for y in 0..l.height {
+                let o = self.element_at(&l, 0, y, slice);
+                let n = src.len().saturating_sub(o).min(row) / e * e;
+                if n > 0 {
+                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
+                }
+            }
             return out;
         }
-        // `element_at` with the columns' parts of the offset computed once for all rows (the
-        // per-element divisions made this the submit thread's main cost while a title streams)
-        let cols: Vec<(usize, usize)> = (0..l.width).map(|x| self.layout.column_part(x + l.origin.0)).collect();
-        for (y, dst) in out.chunks_exact_mut(l.width * e).enumerate() {
-            let (row, ya) = self.layout.row_part(y + l.origin.1, slice, l.pitch);
-            let base = l.offset + row;
-            for (d, &(col, xa)) in dst.chunks_exact_mut(e).zip(&cols) {
-                let o = base + col + (xa ^ ya);
+        // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
+        // depends on y (and the slice) once per row – per element only two lookups and an XOR.
+        // Element by element it was most of a retail game's render thread while it streamed
+        // textures the CPU writes.
+        let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
+        let pitch_blocks = l.pitch.div_ceil(t.block_w);
+        let columns: Vec<(usize, u32)> = (0..l.width)
+            .map(|x| {
+                let x = x + l.origin.0;
+                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
+            })
+            .collect();
+        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
+        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
+            let y = y + l.origin.1;
+            let row_blocks = (y / t.block_h) * pitch_blocks;
+            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
+            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
+                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
                 if let Some(s) = src.get(o..o + e) {
-                    d.copy_from_slice(s);
+                    dst.copy_from_slice(s);
                 }
             }
         }
@@ -468,6 +493,73 @@ mod tests {
         v
     }
 
+    /// Linear levels are copied a row at a time: the same bytes as element by element, for every
+    /// element size, padded rows, every mip and a source cut short (inside a row and inside an
+    /// element).
+    #[test]
+    fn linear_levels_detile_by_rows_as_by_elements() {
+        let by_elements = |c: &Chain, src: &[u8], i: usize| {
+            let l = c.levels[i];
+            let e = 1usize << c.layout.elem_log2;
+            let mut out = vec![0u8; l.width * l.height * e];
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let o = c.element_at(&l, x, y, 0);
+                    if let Some(s) = src.get(o..o + e) {
+                        out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    }
+                }
+            }
+            out
+        };
+        for e in 0..5u32 {
+            for (w, h, mips) in [(3840u32, 4u32, 1u32), (1920, 3, 1), (77, 13, 4), (1, 1, 1), (300, 200, 9)] {
+                let c = Chain::new(Layout::new(0, e, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap(), w, h, 1, mips);
+                let full: Vec<u8> = (0..c.slice_bytes).map(|k| (k * 7 + 3) as u8 | 1).collect();
+                for cut in [full.len(), full.len() / 2 + 1, 5, 0] {
+                    let src = &full[..cut];
+                    for i in 0..c.levels.len() {
+                        assert_eq!(c.detile_level(src, i, 0), by_elements(&c, src, i), "e{e} {w}x{h} level {i} src {cut} B");
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// `detile_level` (offsets split by row and column) gives the bytes element-by-element
+    /// `element_at` does: every mode, element size and pipe configuration, every level (mip
+    /// tails too), a base swizzle and a slice, and a source cut short (bytes past it read as 0).
+    #[test]
+    fn detile_level_matches_element_by_element() {
+        for mode in MODES {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    lay.base_xor = (lay.block_bytes / 2) & !((1 << e) - 1);
+                    let c = Chain::new(lay, 77, 45, 1, 7);
+                    let mem: Vec<u8> = (0..c.slice_bytes * 2).map(|i| (i * 131 % 251) as u8).collect();
+                    let short = &mem[..mem.len() * 3 / 5];
+                    let es = 1usize << e;
+                    for (k, l) in c.levels.iter().enumerate() {
+                        for (slice, src) in [(0, &mem[..]), (3, short)] {
+                            let mut want = vec![0u8; l.width * l.height * es];
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at(l, x, y, slice);
+                                    if let Some(s) = src.get(o..o + es) {
+                                        want[(y * l.width + x) * es..][..es].copy_from_slice(s);
+                                    }
+                                }
+                            }
+                            assert!(c.detile_level(src, k, slice) == want, "mode {mode} e {e} {cfg:?} level {k} slice {slice}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// every mode, element size and pipe configuration: the in-block mapping is a permutation
     /// of the block's elements (catches a mis-parsed table or a wrong block shape)
     #[test]
@@ -485,6 +577,45 @@ mod tests {
                             assert!(!std::mem::replace(&mut seen[o >> e], true), "mode {mode} e {e} {cfg:?}: ({x},{y}) collides");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn high_coordinate_tables_keep_their_offsets_at_one_period() {
+        let full = |bits: &[u64; 20], blk: u32, l: u32, shift: u32| -> Vec<u32> {
+            (0..1u32 << (16 - l.min(16)))
+                .map(|c| {
+                    let mut off = 0u32;
+                    for (i, &b) in bits[..blk as usize].iter().enumerate() {
+                        let mask = ((b >> shift) & 0xFFFF) as u32;
+                        off |= ((mask & (c << l)).count_ones() & 1) << i;
+                    }
+                    off
+                })
+                .collect()
+        };
+        let check = |l: &Layout, bits: &[u64; 20], what: &str| {
+            let blk = l.block_bytes.trailing_zeros();
+            for (t, b, shift) in [(&l.hx, l.block_w, 0), (&l.hy, l.block_h, 16), (&l.hz, l.block_d, 32)] {
+                let want = full(bits, blk, b.trailing_zeros(), shift);
+                assert!(t.len().is_power_of_two() && t.len() <= want.len(), "{what}: table of {} for {}", t.len(), want.len());
+                for c in (0..1usize << 18).step_by(3).chain([u32::MAX as usize, (1 << 40) + 5]) {
+                    assert_eq!(t[c % t.len()], want[c % want.len()], "{what}: shift {shift} coordinate block {c}");
+                }
+            }
+            assert!(l.hz.len() <= 64, "{what}: {} z entries", l.hz.len());
+        };
+        for cfg in configs() {
+            for e in 0..5 {
+                for mode in MODES {
+                    let l = Layout::new(mode, e, cfg).unwrap();
+                    check(&l, &pattern_bits(PATTERNS, mode, e, cfg).unwrap(), &format!("2D mode {mode} e {e} {cfg:?}"));
+                }
+                for mode in [5u32, 9, 17, 21, 25, 26] {
+                    let l = Layout::new_3d(mode, e, cfg).unwrap();
+                    check(&l, &pattern_bits(PATTERNS_3D, mode, e, cfg).unwrap(), &format!("3D mode {mode} e {e} {cfg:?}"));
                 }
             }
         }

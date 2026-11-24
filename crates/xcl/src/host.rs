@@ -66,10 +66,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let sources = crate::hle::d3d12x::title_textures::source_tiles();
                 let src_twice = crate::hle::d3d12x::sparse::mapped_among(&sources) << 16;
                 let zeros = crate::hle::d3d12x::sparse::zero_tiles() << 16;
-                let (sys_tiles, moved) = crate::hle::d3d12x::sparse::sysmem_tiles();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB, {} MB of them on mapped sparse tiles too; {} MB extra tiles, {} textures reading {} MB, {} MB of it on mapped sparse tiles); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped, {} MB of it all zeros); sparse tiles in system memory {} MB ({} moved to video memory)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB, {} MB of them on mapped sparse tiles too; {} MB extra tiles, {} textures reading {} MB, {} MB of it on mapped sparse tiles); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped, {} MB of it all zeros)",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -84,9 +83,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(arenas_made as u64),
                     mb(pools as u64),
                     mb(pools_mapped as u64),
-                    mb(zeros as u64),
-                    mb((sys_tiles << 16) as u64),
-                    moved
+                    mb(zeros as u64)
                 );
                 // (once a minute) where the all-zero tiles are
                 static ZR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -126,6 +123,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
+    crate::hle::kernelx::fine_timer();
     crate::loader::set_cache_dir(boot.cache_dir());
     let mut dirs = vec![boot.game_root.clone()];
     if let Some(p) = boot.exe_path.parent() {

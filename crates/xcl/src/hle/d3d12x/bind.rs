@@ -100,6 +100,27 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
+/// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
+/// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
+/// `from` retains its previously allocated blocks until `allocator` resets).
+pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    });
+    let (old, blocks) = with(to, |s| {
+        let old = std::mem::replace(&mut s.allocator, allocator);
+        s.arena = Default::default();
+        s.layout = layout;
+        s.args = args;
+        s.layout_gfx = layout_gfx;
+        s.args_gfx = args_gfx;
+        s.rs_gfx = rs_gfx;
+        s.pso = pso;
+        (old, std::mem::take(&mut s.uma))
+    });
+    console_list::hold_until_reset(old, blocks);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -221,6 +242,24 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     if !gfx && !compute {
+        // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
+        // the list may hold XCL's ABI root signature from a translated draw before it – the PC
+        // call with that pair is invalid (debug layer 953, "the currently set Root Signature
+        // doesn't match the currently set Pipeline State Object"; a retail title's world then
+        // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
+        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+            }
+            return;
+        }
+        // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
+            list.SetGraphicsRootSignature(r);
+        }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -876,6 +915,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -935,6 +975,28 @@ mod tests {
         assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
         real::forget_pso_for_test(with_gs);
         assert!(cpu_rect_expansion(with_gs));
+    }
+
+    /// An ExecuteIndirect whose bound pipeline is still being built is skipped (its stand-in
+    /// with XCL's ABI root signature on the list is the debug layer's 953 and a hung GPU);
+    /// a built or failed one goes to the PC call. The gate `execute_indirect` uses.
+    #[test]
+    fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
+        let (building, built, failed) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize);
+        // lazy submits: no worker starts them, so the states stay under the test's control
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234), 0);
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235), 0);
+        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
+        assert!(pso_async::is_pending(building));
+        assert_eq!(pso_async::resolve_wait(built), 0x1235);
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        assert!(!pso_async::is_pending(built) && !pso_async::is_pending(failed));
+        // never resolved: still pending (the skip case), then forgotten
+        assert!(pso_async::is_pending(building));
+        pso_async::released(building);
+        pso_async::released(built);
+        pso_async::released(failed);
+        assert!(!pso_async::is_pending(building));
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
